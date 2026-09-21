@@ -1,0 +1,396 @@
+name: Novel -> Sesli Kitap (MP3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Ilk bolum (veya seri sayfasi) linki. Birden cok ise virgulle ayirin"
+        required: true
+        default: "https://novelturk.com/novel/solo-farming-in-the-tower/"
+        type: string
+      name:
+        description: "Klasor adi (istege bagli; bos = linkten otomatik)"
+        required: false
+        default: ""
+        type: string
+      max_chapters:
+        description: "Seri basina bolum siniri (0 = tum seri)"
+        required: true
+        default: "5"
+        type: string
+      fetcher:
+        description: "Indirme motoru (auto: once curl_cffi, gerekirse Playwright)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - curl
+          - playwright
+      voice:
+        description: "Ses secenegi"
+        required: true
+        default: "tr-TR-AhmetNeural"
+        type: choice
+        options:
+          - tr-TR-AhmetNeural
+          - tr-TR-EmelNeural
+      rate:
+        description: "Konusma hizi (ornek: +0%, +10%, -15%)"
+        required: false
+        default: "+0%"
+        type: string
+      chapters_per_job:
+        description: "Her paralel ses job'inin isleyecegi en fazla bolum sayisi"
+        required: true
+        default: "100"
+        type: string
+      max_parallel:
+        description: "Ayni anda calisacak en fazla ses job'i (ucretsiz planda ust sinir 20)"
+        required: true
+        default: "10"
+        type: string
+      probe:
+        description: "Sadece erisim tanisi yap (indirme ve ses yok) - yeni sitede once bunu deneyin"
+        type: boolean
+        default: false
+      site_config:
+        description: "Repo icindeki site_profiles.json yolu (istege bagli; sorunlu bir site icin kalici CSS secici/gurultu/guess ayari)"
+        required: false
+        default: ""
+        type: string
+      format:
+        description: "Uretilecek ciktilar (txt: yalnizca bolum metni, ses/epub uretmez)"
+        required: true
+        default: "mp3"
+        type: choice
+        options:
+          - mp3
+          - epub
+          - txt
+          - "mp3,epub"
+          - "mp3,txt"
+          - "epub,txt"
+          - "mp3,epub,txt"
+      translate_to:
+        description: "Hedef dil kodu (ör. en, de, tr) - DOLU birakilirsa ceviri calisir, BOS birakilirsa atlanir"
+        required: false
+        default: ""
+        type: string
+      translate_source:
+        description: "Kaynak icerigin GERCEK dili (ör. metin Ingilizce'yse 'en', Turkce'yse 'tr'; 'auto' = otomatik algila). translate_to ile AYNI degeri VERMEYIN, yoksa ceviri sessizce hicbir sey yapmaz."
+        required: true
+        default: "auto"
+        type: string
+      translate_engine:
+        description: "Ceviri motoru (gemini: EN IYI kalite, ucretsiz API anahtari gerekir | google: GitHub'da genelde engelli | argos: cevrimdisi, dusuk kalite)"
+        required: true
+        default: "gemini"
+        type: choice
+        options:
+          - gemini
+          - google
+          - argos
+      epub_author:
+        description: "EPUB icin yazar adi (istege bagli)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1) Bolumleri sirayla cek -> TXT (kazima paralellesmez: her bolumun
+  #    "sonraki" baglantisi bir onceki sayfadan gelir)  +  paralel is plani
+  # ---------------------------------------------------------------------
+  scrape:
+    name: Bolumleri cek (TXT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      # probe modunda plan adimi calismaz; matrix bos kalmasin diye yedek deger
+      matrix: "${{ steps.plan.outputs.matrix || '{\"include\":[{\"shard\":0}]}' }}"
+      shards: ${{ steps.plan.outputs.shards }}
+      # translate_to bosken orijinal, doluyken cevrilmis metnin oldugu artifact adi (convert/epub job'lari bunu indirir)
+      txt_artifact: ${{ steps.vars.outputs.txt_artifact }}
+    env:
+      # Girdiler shell komutuna dogrudan gomulmez (script injection'a karsi)
+      NOVEL_URLS: ${{ inputs.url }}
+      NOVEL_NAME: ${{ inputs.name }}
+      NOVEL_MAX_CHAPTERS: ${{ inputs.max_chapters }}
+      NOVEL_FETCHER: ${{ inputs.fetcher }}
+      PER_JOB: ${{ inputs.chapters_per_job }}
+      # Birden fazla proxy icin secret'a virgulle ayrilmis liste yazabilirsiniz (ör. http://a,http://b)
+      NOVEL_PROXY: ${{ secrets.NOVEL_PROXY || secrets.NOVELTURK_PROXY }}   # istege bagli
+      NOVEL_SITE_CONFIG: ${{ inputs.site_config }}   # istege bagli; repo'daki site_profiles.json yolu
+
+    steps:
+      - name: Depoyu cek
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Bagimliliklar (curl_cffi guncel olmali, yeni tarayici parmak izleri icin)
+        run: python -m pip install -U -r requirements.txt
+
+      - name: Tarayici motoru (Playwright Chromium)
+        if: ${{ inputs.fetcher != 'curl' }}
+        run: python -m playwright install --with-deps chromium
+
+      - name: Erisim tanisi (probe)
+        if: ${{ inputs.probe }}
+        run: python novelturk_audio.py probe
+
+      - name: Seri anahtarini hesapla (cache SADECE ayni seri icin paylasilsin diye)
+        id: series
+        if: ${{ !inputs.probe }}
+        run: |
+          raw="${{ inputs.name }}"
+          if [ -z "$raw" ]; then raw="${{ inputs.url }}"; fi
+          # cache anahtari icin guvenli hale getir (bosluk/virgul/ozel karakter cache key'de sorun cikarabilir)
+          safe=$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-150)
+          echo "key=$safe" >> "$GITHUB_OUTPUT"
+
+      - name: Onceki TXT/durum kayitlarini geri yukle (kaldigi yerden devam; SADECE bu seri icin)
+        if: ${{ !inputs.probe }}
+        uses: actions/cache/restore@v6
+        with:
+          path: txt
+          key: novel-txt-${{ steps.series.outputs.key }}-${{ github.run_id }}
+          # Onemli: onek burada da seriye ozel (novel-txt-<seri>-), boylece baska bir seri/is akisinin
+          # onceki calistirmasindan kalma bolumler asla bu klasore karismaz.
+          restore-keys: novel-txt-${{ steps.series.outputs.key }}-
+
+      - name: Bolumleri TXT olarak cek
+        if: ${{ !inputs.probe }}
+        run: python novelturk_audio.py scrape --txt-dir txt
+
+      # Kaynak dildeki TXT'yi cache'e ve artifact'a ceviriden ONCE kaydediyoruz: boylece
+      # sonraki calistirmalarda "kaldigi yerden devam" (resume) her zaman orijinal metinle calisir.
+      - name: TXT/durum kayitlarini sakla (orijinal dil; SADECE bu seri icin)
+        if: ${{ !inputs.probe && always() }}
+        uses: actions/cache/save@v6
+        with:
+          path: txt
+          key: novel-txt-${{ steps.series.outputs.key }}-${{ github.run_id }}
+
+      - name: TXT dosyalarini yukle (orijinal dil)
+        if: ${{ !inputs.probe && always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: txt-${{ github.run_id }}
+          path: txt/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cevir (opsiyonel; translate_to doluysa calisir; ses/epub asamalari bu ceviriden uretilir, cache/resume etkilenmez)
+        if: ${{ !inputs.probe && inputs.translate_to != '' }}
+        env:
+          TRANSLATE_TO: ${{ inputs.translate_to }}
+          TRANSLATE_SOURCE: ${{ inputs.translate_source }}
+          TRANSLATE_ENGINE: ${{ inputs.translate_engine }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # Settings > Secrets and variables > Actions'a ekleyin
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}          # istege bagli (repo Variables); bos = gemini-2.5-flash
+          GEMINI_MIN_INTERVAL: ${{ vars.GEMINI_MIN_INTERVAL }}   # istege bagli; istekler arasi sn (varsayilan 7)
+        run: |
+          if [ "$TRANSLATE_ENGINE" = "google" ]; then
+            python -m pip install -q -U deep-translator
+          elif [ "$TRANSLATE_ENGINE" = "argos" ]; then
+            python -m pip install -q -U argostranslate
+          fi   # gemini: ek paket gerekmez
+          python novelturk_audio.py translate --txt-dir txt --translate-out "txt_${TRANSLATE_TO}" \
+            --translate-to "$TRANSLATE_TO" --translate-source "$TRANSLATE_SOURCE" \
+            --translate-engine "$TRANSLATE_ENGINE"
+
+      - name: Cevrilmis TXT dosyalarini yukle
+        if: ${{ !inputs.probe && inputs.translate_to != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: txt-tr-${{ github.run_id }}
+          path: txt_${{ inputs.translate_to }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Sonraki job'larin hangi TXT artifact'ini kullanacagini belirle
+        id: vars
+        if: ${{ !inputs.probe }}
+        run: |
+          if [ -n "${{ inputs.translate_to }}" ]; then
+            echo "txt_artifact=txt-tr-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            rm -rf txt && mv "txt_${{ inputs.translate_to }}" txt   # plan adimi da cevrilmis metni saysin
+          else
+            echo "txt_artifact=txt-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Teshis (kac TXT uretildi, ilk dosyalar ne?)
+        if: ${{ !inputs.probe }}
+        run: |
+          find txt -name '*.txt' | wc -l
+          find txt -name '*.txt' | sort | head -5
+
+      - name: Paralel is plani olustur
+        id: plan
+        if: ${{ !inputs.probe }}
+        run: python novelturk_audio.py plan --txt-dir txt --per-job "$PER_JOB"
+
+  # ---------------------------------------------------------------------
+  # 2) Her bolum araligini ayri bir runner'da seslendir
+  # ---------------------------------------------------------------------
+  convert:
+    name: Ses ${{ matrix.shard }} - ${{ matrix.slug }} (bolum ${{ matrix.start }}-${{ matrix.end }})
+    needs: scrape
+    if: ${{ !inputs.probe && contains(inputs.format, 'mp3') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false   # bir parca patlasa da digerleri devam etsin
+      max-parallel: ${{ fromJSON(inputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.scrape.outputs.matrix) }}
+    env:
+      SLUG: ${{ matrix.slug }}
+      START: ${{ matrix.start }}
+      END: ${{ matrix.end }}
+      VOICE: ${{ inputs.voice }}
+      RATE: ${{ inputs.rate }}
+
+    steps:
+      - name: Depoyu cek
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Bagimliliklar (ses asamasi icin hafif set)
+        run: python -m pip install -U edge-tts beautifulsoup4 lxml tqdm
+
+      - name: TXT dosyalarini indir
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.scrape.outputs.txt_artifact }}
+          path: txt
+
+      - name: Teshis (TXT klasorunde ne var, hangi aralik islenecek?)
+        run: |
+          echo "Seri: $SLUG | aralik: $START-$END"
+          ls txt
+          echo "TXT sayisi: $(find "txt/$SLUG" -name '*.txt' | wc -l)"
+          ls "txt/$SLUG" | sed -n '1,5p'
+
+      - name: Bolum araligini sesli kitaba donustur
+        # script '--rate -15%' yazimini da '--rate=-15%' olarak cozer; '=' bicimi yine de en guvenlisi
+        run: |
+          python novelturk_audio.py tts \
+            --txt-dir txt \
+            --mp3-dir mp3 \
+            --slug "$SLUG" \
+            --start "$START" \
+            --end "$END" \
+            --voice "$VOICE" \
+            --rate="${RATE:-+0%}"
+
+      - name: Ozet yaz
+        if: always()
+        run: |
+          {
+            echo "### Parça ${{ matrix.shard }} — $SLUG (bölüm $START-$END)"
+            echo ""
+            if [ -d mp3 ] && [ -n "$(find mp3 -name '*.mp3' -print -quit)" ]; then
+              find mp3 -name '*.mp3' -printf '- `%P` — %k KiB\n' | sort
+            else
+              echo "_Hiç MP3 üretilmedi._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: MP3 dosyalarini artifact olarak yukle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mp3-${{ github.run_id }}-part-${{ matrix.shard }}
+          path: mp3/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0   # MP3 zaten sikistirilmis
+
+  # ---------------------------------------------------------------------
+  # 2b) EPUB (istege bagli; --format icinde 'epub' varsa calisir, tek job yeterli)
+  # ---------------------------------------------------------------------
+  epub:
+    name: E-kitap (EPUB)
+    needs: scrape
+    if: ${{ !inputs.probe && contains(inputs.format, 'epub') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Depoyu cek
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Bagimliliklar (epub asamasi icin hafif set)
+        run: python -m pip install -U ebooklib beautifulsoup4 lxml tqdm
+
+      - name: TXT dosyalarini indir
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.scrape.outputs.txt_artifact }}
+          path: txt
+
+      - name: TXT bolumlerinden EPUB uret
+        run: python novelturk_audio.py epub --txt-dir txt --epub-out epub --epub-author "${{ inputs.epub_author }}"
+
+      - name: Ozet yaz
+        if: always()
+        run: |
+          {
+            echo "### EPUB"
+            echo ""
+            if [ -d epub ] && [ -n "$(find epub -name '*.epub' -print -quit)" ]; then
+              find epub -name '*.epub' -printf '- `%P` — %k KiB\n' | sort
+            else
+              echo "_Hiç EPUB üretilmedi._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: EPUB dosyalarini artifact olarak yukle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: epub-${{ github.run_id }}
+          path: epub/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # 3) Tum ses parcalarini tek artifact'ta birlestir
+  # ---------------------------------------------------------------------
+  merge:
+    name: Artifact'lari birlestir
+    needs: [scrape, convert]
+    if: ${{ !cancelled() && !inputs.probe && contains(inputs.format, 'mp3') && needs.scrape.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write   # delete-merged: parca artifact'larini silebilmek icin
+    steps:
+      - name: Parcalari tek artifact'ta topla
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: audiobook-${{ github.run_id }}
+          pattern: mp3-${{ github.run_id }}-part-*
+          delete-merged: true
+          retention-days: 7
+          compression-level: 0
